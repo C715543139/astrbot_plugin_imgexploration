@@ -15,7 +15,9 @@ from astrbot.api import llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core import AstrBotConfig
-from astrbot.core.message.components import Image, Node, Nodes, Plain, Reply
+import astrbot.api.message_components as Comp
+
+from astrbot.core.message.components import Node, Nodes, Plain, Reply
 
 from .ascii2d_strategy import Ascii2dStrategy
 from .constant import LLM_TOOLS
@@ -219,24 +221,126 @@ class ImgExplorationPlugin(Star):
     # 消息监听器 - 捕获图片到上下文
     # ==================================================================
 
-    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    @filter.event_message_type(
+        filter.EventMessageType.ALL,
+        priority=100,
+    )
     async def on_message(self, event: AstrMessageEvent):
-        """监听所有消息，捕获图片到上下文."""
-        messages = event.get_messages()
+        """监听所有消息，并兼容不同 AstrBot 版本的图片组件格式."""
+
+        logger.warning(
+            "[ImgExploration-Debug] 图片上下文监听器已进入，"
+            f"session={event.unified_msg_origin}"
+        )
+
         image_ctx = get_image_context_manager()
+        captured_urls: set[str] = set()
+
+        message_obj = getattr(event, "message_obj", None)
+
+        message_id = str(
+            getattr(message_obj, "message_id", "")
+            or getattr(event, "message_id", "")
+        )
+
+        try:
+            sender_id = str(event.get_sender_id())
+        except Exception:
+            sender_id = str(getattr(event, "user_id", ""))
+
+        # 第一种方式：读取 AstrBot 已解析的消息组件
+        try:
+            messages = event.get_messages()
+        except Exception as exc:
+            logger.warning(
+                f"[ImgExploration-Debug] event.get_messages() 失败: {exc}"
+            )
+            messages = getattr(message_obj, "message", []) or []
+
+        logger.warning(
+            "[ImgExploration-Debug] 消息组件类型: "
+            + repr(
+                [
+                    {
+                        "class": (
+                            type(comp).__module__
+                            + "."
+                            + type(comp).__name__
+                        ),
+                        "url": getattr(comp, "url", None),
+                        "file": getattr(comp, "file", None),
+                    }
+                    for comp in messages
+                ]
+            )
+        )
 
         for comp in messages:
-            if isinstance(comp, Image):
-                # 获取图片 URL
-                url = comp.url or comp.file
-                if url and url.startswith(("http://", "https://")):
-                    image_ctx.add_image(
-                        event,
-                        url,
-                        message_id=str(getattr(event, "message_id", "")),
-                        sender_id=str(getattr(event, "user_id", "")),
-                    )
-                    logger.debug(f"[ImgExploration] 捕获图片到上下文: {url[:50]}...")
+            # 同时兼容公共 API 类型和可能存在的旧版内部类型
+            is_image = (
+                isinstance(comp, Comp.Image)
+                or type(comp).__name__ == "Image"
+            )
+
+            if not is_image:
+                continue
+
+            url = (
+                getattr(comp, "url", None)
+                or getattr(comp, "file", None)
+            )
+
+            if (
+                isinstance(url, str)
+                and url.startswith(("http://", "https://"))
+            ):
+                captured_urls.add(url)
+
+        # 第二种方式：直接从 aiocqhttp / OneBot 原始消息中兜底读取
+        raw_message = getattr(message_obj, "raw_message", None)
+
+        if isinstance(raw_message, dict):
+            raw_segments = raw_message.get("message", [])
+
+            if isinstance(raw_segments, list):
+                for segment in raw_segments:
+                    if not isinstance(segment, dict):
+                        continue
+
+                    if segment.get("type") != "image":
+                        continue
+
+                    data = segment.get("data", {})
+                    if not isinstance(data, dict):
+                        continue
+
+                    url = data.get("url") or data.get("file")
+
+                    if (
+                        isinstance(url, str)
+                        and url.startswith(("http://", "https://"))
+                    ):
+                        captured_urls.add(url)
+
+        for url in captured_urls:
+            image_ctx.add_image(
+                event,
+                url,
+                message_id=message_id,
+                sender_id=sender_id,
+            )
+
+            context_info = image_ctx.get_image_context_info(event)
+
+            logger.warning(
+                "[ImgExploration-Debug] 图片捕捉完成，"
+                f"当前会话图片数量={context_info['count']}"
+            )
+
+        if not captured_urls:
+            logger.warning(
+                "[ImgExploration-Debug] 当前消息未提取到可用的 HTTP 图片 URL"
+            )
 
     # ==================================================================
     # LLM Tools - AI 工具函数
